@@ -1,9 +1,7 @@
 #include "RuntimeCuda.hpp"
 
 #include <cuda_runtime.h>
-#include <thrust/device_ptr.h>
-#include <thrust/execution_policy.h>
-#include <thrust/scan.h>
+#include <cub/device/device_scan.cuh>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -73,6 +71,8 @@ struct DeviceNeighborGridBuffers {
     int* cellStarts = nullptr;
     int* cellWriteOffsets = nullptr;
     int* particleIndices = nullptr;
+    void* scanTempStorage = nullptr;
+    size_t scanTempStorageBytes = 0;
     int cellCapacity = 0;
     int particleCapacity = 0;
 };
@@ -110,6 +110,11 @@ void ReleaseDeviceParticleBuffers() {
         cudaFree(g_deviceNeighborGridBuffers.particleIndices);
         g_deviceNeighborGridBuffers.particleIndices = nullptr;
     }
+    if (g_deviceNeighborGridBuffers.scanTempStorage != nullptr) {
+        cudaFree(g_deviceNeighborGridBuffers.scanTempStorage);
+        g_deviceNeighborGridBuffers.scanTempStorage = nullptr;
+    }
+    g_deviceNeighborGridBuffers.scanTempStorageBytes = 0;
     g_deviceNeighborGridBuffers.cellCapacity = 0;
     g_deviceNeighborGridBuffers.particleCapacity = 0;
 }
@@ -160,10 +165,6 @@ bool EnsureDeviceNeighborGridBuffers(int particleCount, int cellCount) {
         && g_deviceNeighborGridBuffers.cellStarts != nullptr
         && g_deviceNeighborGridBuffers.cellWriteOffsets != nullptr;
 
-    if (particleCapacityOk && cellCapacityOk) {
-        return true;
-    }
-
     if (!particleCapacityOk) {
         if (g_deviceNeighborGridBuffers.particleIndices != nullptr) {
             cudaFree(g_deviceNeighborGridBuffers.particleIndices);
@@ -207,6 +208,39 @@ bool EnsureDeviceNeighborGridBuffers(int particleCount, int cellCount) {
             return false;
         }
         g_deviceNeighborGridBuffers.cellCapacity = cellCount;
+    }
+
+    size_t requiredScanTempStorageBytes = 0;
+    const cudaError_t scanQueryResult = cub::DeviceScan::ExclusiveSum(
+        nullptr,
+        requiredScanTempStorageBytes,
+        g_deviceNeighborGridBuffers.cellCounts,
+        g_deviceNeighborGridBuffers.cellStarts,
+        cellCount
+    );
+    if (scanQueryResult != cudaSuccess) {
+        ReleaseDeviceParticleBuffers();
+        return false;
+    }
+
+    const bool scanTempStorageOk =
+        g_deviceNeighborGridBuffers.scanTempStorage != nullptr
+        && g_deviceNeighborGridBuffers.scanTempStorageBytes >= requiredScanTempStorageBytes;
+    if (!scanTempStorageOk) {
+        if (g_deviceNeighborGridBuffers.scanTempStorage != nullptr) {
+            cudaFree(g_deviceNeighborGridBuffers.scanTempStorage);
+            g_deviceNeighborGridBuffers.scanTempStorage = nullptr;
+            g_deviceNeighborGridBuffers.scanTempStorageBytes = 0;
+        }
+        if (requiredScanTempStorageBytes > 0
+            && cudaMalloc(
+                &g_deviceNeighborGridBuffers.scanTempStorage,
+                requiredScanTempStorageBytes
+            ) != cudaSuccess) {
+            ReleaseDeviceParticleBuffers();
+            return false;
+        }
+        g_deviceNeighborGridBuffers.scanTempStorageBytes = requiredScanTempStorageBytes;
     }
 
     return true;
@@ -1048,14 +1082,15 @@ extern "C" int SimCudaRunBallPhysics(
     float remaining = totalDelta;
     float lastStep = 0.0f;
     int executedSubsteps = 0;
+    const float stableSubstepSeconds = ComputeStableSubstepSeconds(
+        particles,
+        count,
+        *params,
+        deviceParams,
+        totalDelta
+    );
     for (int step = 0; step < substepBudget && remaining > 1e-7f; ++step) {
-        float stepSeconds = ComputeStableSubstepSeconds(
-            particles,
-            count,
-            *params,
-            deviceParams,
-            remaining
-        );
+        float stepSeconds = fminf(stableSubstepSeconds, remaining);
         const int stepsLeft = (substepBudget - step) > 0 ? (substepBudget - step) : 1;
         const float minStepForCoverage = remaining / static_cast<float>(stepsLeft);
         stepSeconds = fmaxf(stepSeconds, minStepForCoverage);
@@ -1083,15 +1118,14 @@ extern "C" int SimCudaRunBallPhysics(
             return 0;
         }
 
-        thrust::device_ptr<const int> countsPtr(g_deviceNeighborGridBuffers.cellCounts);
-        thrust::device_ptr<int> startsPtr(g_deviceNeighborGridBuffers.cellStarts);
-        thrust::exclusive_scan(
-            thrust::device,
-            countsPtr,
-            countsPtr + cellCount,
-            startsPtr
+        const cudaError_t scanResult = cub::DeviceScan::ExclusiveSum(
+            g_deviceNeighborGridBuffers.scanTempStorage,
+            g_deviceNeighborGridBuffers.scanTempStorageBytes,
+            g_deviceNeighborGridBuffers.cellCounts,
+            g_deviceNeighborGridBuffers.cellStarts,
+            cellCount
         );
-        if (cudaPeekAtLastError() != cudaSuccess) {
+        if (scanResult != cudaSuccess) {
             ReleaseDeviceParticleBuffers();
             return 0;
         }
@@ -1156,11 +1190,6 @@ extern "C" int SimCudaRunBallPhysics(
         temp = current;
         current = next;
         next = temp;
-    }
-
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-        ReleaseDeviceParticleBuffers();
-        return 0;
     }
 
     if (cudaMemcpy(particles, current, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
