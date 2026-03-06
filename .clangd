@@ -1,0 +1,38 @@
+Index:
+  Background: Build
+
+Diagnostics:
+  UnusedIncludes: None
+  Suppress: [
+    "typename_nested_not_found",
+    "typecheck_nonviable_condition",
+    "override_keyword_only_allowed_on_virtual_member_functions"
+  ]
+---
+If:
+  PathMatch: .*\.cu$
+CompileFlags:
+  Remove: [
+    "-forward-unknown-to-host-compiler",
+    "-ccbin=*",
+    "-Xcompiler=*",
+    "-Fd*",
+    "-FS",
+    "/GR",
+    "/EHsc",
+    "/RTC1",
+  ]
+  Add: [
+    "-xcuda",
+    "--cuda-gpu-arch=sm_89",
+    "--cuda-path=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1",
+    "-Wno-unknown-cuda-version",
+    "-Wno-invalid-token-paste",
+    "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH",
+    "-D_MSVC_ENABLE_CUDA_WORKAROUNDS",
+    "-DNOMINMAX",
+    "--target=x86_64-pc-windows-msvc",
+    "-fms-extensions",
+    "-fms-compatibility",
+    "-fdelayed-template-parsing",
+  ]

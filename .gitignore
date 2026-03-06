@@ -1,0 +1,12 @@
+.xmake/
+build/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+compile_commands.json
+.vs/
+./cache/
