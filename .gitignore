@@ -9,4 +9,4 @@ build/
 *.exe
 compile_commands.json
 .vs/
-./cache/
+.cache/
